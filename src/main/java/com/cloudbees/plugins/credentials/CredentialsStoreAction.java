@@ -62,8 +62,11 @@ import java.io.OutputStreamWriter;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
@@ -82,6 +85,7 @@ import jenkins.model.Jenkins;
 import jenkins.util.xml.XMLUtils;
 import net.sf.json.JSONObject;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.jenkins.ui.icon.IconSpec;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -124,6 +128,8 @@ public abstract class CredentialsStoreAction
      * Expose {@link CredentialsProvider#MANAGE_DOMAINS} for Jelly.
      */
     public static final Permission MANAGE_DOMAINS = CredentialsProvider.MANAGE_DOMAINS;
+
+    private static final Logger LOGGER = Logger.getLogger(CredentialsStoreAction.class.getName());
 
     /**
      * An {@link XStream2} that replaces {@link Secret} and {@link SecretBytes} instances with {@code <secret-redacted/>}
@@ -766,23 +772,56 @@ public abstract class CredentialsStoreAction
                     return HttpResponses.status(HttpServletResponse.SC_CONFLICT);
                 }
             } else {
-                JSONObject data = req.getSubmittedForm();
-                Credentials credentials = Descriptor.bindJSON(req, Credentials.class, data.getJSONObject("credentials"));
-                boolean credentialsWereAdded = getStore().addCredentials(domain, credentials);
+                try {
+                    JSONObject data = req.getSubmittedForm();
+                    Credentials credentials = Descriptor.bindJSON(req, Credentials.class, data.getJSONObject("credentials"));
+                    boolean credentialsWereAdded = getStore().addCredentials(domain, credentials);
 
-                if (jsonResponse) {
-                    if (credentialsWereAdded) {
-                        return HttpResponses.okJSON(new JSONObject()
-                                .element("message", "Credentials created")
-                                .element("notificationType", "SUCCESS"));
-                    } else {
-                        return HttpResponses.okJSON(new JSONObject()
-                                .element("message", "Credentials with specified ID already exist")
-                                // TODO: or domain does not exist at all?
-                                .element("notificationType", "ERROR"));
+                    if (jsonResponse) {
+                        if (credentialsWereAdded) {
+                            return HttpResponses.okJSON(new JSONObject()
+                                    .element("message", "Credentials created")
+                                    .element("notificationType", "SUCCESS"));
+                        } else {
+                            String message;
+                            if (getStore().getDomains().contains(domain)) {
+                                message = "Credentials with specified ID already exist";
+                            } else {
+                                message = "Domain '" + getDisplayName() + "' does not exist";
+                            }
+                            return HttpResponses.okJSON(new JSONObject()
+                                    .element("message", message)
+                                    .element("notificationType", "ERROR"));
+                        }
                     }
+                    return HttpResponses.redirectTo("../../domain/" + getUrlName());
+                } catch (LinkageError e) {
+                    /*
+                     * Descriptor#newInstanceImpl throws a LinkageError if the DataBoundConstructor or any DataBoundSetter
+                     * throw any exception other than RuntimeException implementing HttpResponse.
+                     *
+                     * Checked exceptions implementing HttpResponse like FormException are wrapped and
+                     * rethrown as HttpResponseException (a RuntimeException implementing HttpResponse) in
+                     * RequestImpl#invokeConstructor.
+                     *
+                     * This approach is taken to maintain backward compatibility, as throwing a FormException directly
+                     * from the constructor would result in a source-incompatible change, potentially breaking dependent plugins.
+                     *
+                     * Here, known exceptions are caught specifically to provide meaningful error response.
+                     */
+                    Throwable rootCause = ExceptionUtils.getRootCause(e);
+                    if (rootCause instanceof IOException || rootCause instanceof IllegalArgumentException
+                            || rootCause instanceof GeneralSecurityException) {
+                        LOGGER.log(Level.WARNING, "Failed to create Credentials", e);
+                        if (jsonResponse) {
+                            return HttpResponses.okJSON(new JSONObject()
+                                    .element("message", rootCause.getMessage())
+                                    .element("notificationType", "ERROR"));
+                        }
+                        return HttpResponses.redirectTo("../../domain/" + getUrlName());
+                    }
+                    throw e;
                 }
-                return HttpResponses.redirectTo("../../domain/" + getUrlName());
             }
         }
 
@@ -1379,22 +1418,50 @@ public abstract class CredentialsStoreAction
             String acceptHeader = req.getHeader("Accept");
             boolean jsonResponse = acceptHeader != null && acceptHeader.contains("application/json");
 
-            JSONObject data = req.getSubmittedForm();
-            Credentials credentials = Descriptor.bindJSON(req, Credentials.class, data);
-            if (!getStore().updateCredentials(this.domain.domain, this.credentials, credentials)) {
+            try {
+                JSONObject data = req.getSubmittedForm();
+                Credentials credentials = Descriptor.bindJSON(req, Credentials.class, data);
+                if (!getStore().updateCredentials(this.domain.domain, this.credentials, credentials)) {
+                    if (jsonResponse) {
+                        return HttpResponses.okJSON(new JSONObject()
+                                .element("message", "Credentials could not be updated due to a concurrent modification")
+                                .element("notificationType", "ERROR"));
+                    }
+                    return HttpResponses.redirectTo("concurrentModification");
+                }
                 if (jsonResponse) {
                     return HttpResponses.okJSON(new JSONObject()
-                            .element("message", "Credentials could not be updated due to a concurrent modification")
-                            .element("notificationType", "ERROR"));
+                            .element("message", "Credentials updated")
+                            .element("notificationType", "SUCCESS"));
                 }
-                return HttpResponses.redirectTo("concurrentModification");
+                return HttpResponses.redirectToDot();
+            } catch (LinkageError e) {
+                /*
+                 * Descriptor#newInstanceImpl throws a LinkageError if the DataBoundConstructor or any DataBoundSetter
+                 * throw any exception other than RuntimeException implementing HttpResponse.
+                 *
+                 * Checked exceptions implementing HttpResponse like FormException are wrapped and
+                 * rethrown as HttpResponseException (a RuntimeException implementing HttpResponse) in
+                 * RequestImpl#invokeConstructor.
+                 *
+                 * This approach is taken to maintain backward compatibility, as throwing a FormException directly
+                 * from the constructor would result in a source-incompatible change, potentially breaking dependent plugins.
+                 *
+                 * Here, known exceptions are caught specifically to provide meaningful error response.
+                 */
+                Throwable rootCause = ExceptionUtils.getRootCause(e);
+                if (rootCause instanceof IOException || rootCause instanceof IllegalArgumentException
+                        || rootCause instanceof GeneralSecurityException) {
+                    LOGGER.log(Level.WARNING, "Failed to update Credentials", e);
+                    if (jsonResponse) {
+                        return HttpResponses.okJSON(new JSONObject()
+                                .element("message", rootCause.getMessage())
+                                .element("notificationType", "ERROR"));
+                    }
+                    return HttpResponses.redirectToDot();
+                }
+                throw e;
             }
-            if (jsonResponse) {
-                return HttpResponses.okJSON(new JSONObject()
-                        .element("message", "Credentials updated")
-                        .element("notificationType", "SUCCESS"));
-            }
-            return HttpResponses.redirectToDot();
         }
 
         /**
